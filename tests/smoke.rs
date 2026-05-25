@@ -23,7 +23,7 @@ fn base_config(workspace: PathBuf) -> SandboxConfig {
             max_file_size_bytes: 16 * 1024 * 1024,
             stack_size_bytes:    8 * 1024 * 1024,
         },
-        cgroup_parent:       PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice"),
+        cgroup_parent:       PathBuf::from("/sys/fs/cgroup/user.slice/user-0.slice"),
         extra_ro_mounts:     vec![
             (PathBuf::from("/bin"), PathBuf::from("/bin")),
             (PathBuf::from("/lib"), PathBuf::from("/lib")),

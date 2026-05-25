@@ -1,8 +1,3 @@
-#![cfg_attr(
-    not(target_os = "linux"),
-    compile_error!("brink only supports Linux (x86_64-unknown-linux-gnu)")
-)]
-
 //! `brink` — defense-in-depth Linux process sandbox.
 //!
 //! # Security layers (outermost → innermost)
@@ -52,6 +47,9 @@
 //!     });
 //! }
 //! ```
+
+#[cfg(not(target_os = "linux"))]
+compile_error!("brink only supports Linux (x86_64-unknown-linux-gnu)");
 
 mod cgroup;
 mod config;
