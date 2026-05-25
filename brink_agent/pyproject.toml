@@ -1,0 +1,27 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name            = "brink-agent"
+version         = "0.1.0"
+description     = "OpenAI Agents SDK integration for the brink Linux sandbox"
+readme          = "README.md"
+requires-python = ">=3.11"
+license         = { text = "MIT" }
+dependencies    = [
+    "openai-agents>=0.0.7",
+    "openai>=1.0",
+]
+
+[project.scripts]
+# lets you run: brink-agent "write me a fibonacci script"
+brink-agent = "brink_agent.agent:_cli_main"
+
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["brink_agent*"]
+
+[tool.setuptools.package-data]
+# ship the pre-built binary alongside the Python code
+brink_agent = ["bin/brink-run"]
