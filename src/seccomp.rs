@@ -407,6 +407,8 @@ const ALLOWED_SYSCALL_NRS: &[u32] = &[
     libc::SYS_getpriority              as u32,
 
     // Misc
+    libc::SYS_membarrier       as u32,  // required by JVM G1/ZGC garbage collectors
+    libc::SYS_rseq             as u32,  // glibc 2.35+ thread-local storage; EPERM ok but allow cleanly
     libc::SYS_uname            as u32,
     libc::SYS_getrandom        as u32,
     libc::SYS_memfd_create     as u32,

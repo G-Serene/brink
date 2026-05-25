@@ -1,42 +1,31 @@
 """
-brink + OpenAI Agents SDK — end-to-end demo
+brink + OpenAI Agents SDK — multi-language demo with file context
 
-Run on the Hetzner VM (or any Ubuntu 24.04 machine with kernel 6.8+, cgroup v2):
-
+Run on the Linux VM:
     export OPENAI_API_KEY=sk-...
-    export BRINK_BIN=/path/to/target/release/brink-run      # or put it on PATH
-    export BRINK_CGROUP_PARENT=/sys/fs/cgroup/user.slice/user-0.slice  # root
+    export BRINK_BIN=~/sandbox-core/target/release/brink-run
+    export BRINK_CGROUP_PARENT=/sys/fs/cgroup/user.slice/user-0.slice
     python examples/agent_demo.py
-
-The agent will write code, execute it inside the brink sandbox, and return
-the output — all in one conversation turn.
 """
 
 import asyncio
 import os
 import sys
 
-# Allow running from the repo root without installing the package
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from agents import Runner
 from brink_agent import BrinkRunner
 from brink_agent.agent import make_agent
 
-# ── Configure the sandbox runner ─────────────────────────────────────────────
-
 runner = BrinkRunner(
-    # cgroup v2 delegation root. Adjust for your setup:
-    #   root on Hetzner/bare-metal : /sys/fs/cgroup/user.slice/user-0.slice
-    #   non-root with systemd      : /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice
     cgroup_parent=os.environ.get(
         "BRINK_CGROUP_PARENT",
         "/sys/fs/cgroup/user.slice/user-0.slice",
     ),
     memory_mb=128,
     cpu_pct=50,
-    timeout_secs=10,
-    # Make standard system paths visible inside the sandbox rootfs.
+    timeout_secs=15,
     extra_ro_mounts=[
         ("/bin",  "/bin"),
         ("/lib",  "/lib"),
@@ -47,19 +36,33 @@ runner = BrinkRunner(
 
 agent = make_agent(runner)
 
-# ── Run a few demo prompts ────────────────────────────────────────────────────
-
 PROMPTS = [
-    "Write a Python script that prints the first 10 Fibonacci numbers and run it",
-    "Use bash to count how many files are in /usr/bin and show me the top 5 by name",
-    "Write Python code that raises a ZeroDivisionError and show me what happens",
+    # Python — plain code
+    "Write Python that prints the first 10 Fibonacci numbers",
+
+    # Bash
+    "Use bash to count the number of files in /usr/bin and print the result",
+
+    # Python with file context — agent should use run_code_with_files
+    (
+        "I have a CSV file with columns name,score. "
+        "Calculate the average score and print it. "
+        "The file content is:\n"
+        "name,score\nAlice,85\nBob,92\nCarol,78\nDave,95\nEve,88"
+    ),
+
+    # Error handling — seccomp violation
+    "Write Python that tries to open a raw TCP socket to 8.8.8.8 and show what happens",
+
+    # Ruby
+    "Write a Ruby one-liner that prints the squares of 1..10",
 ]
 
 
 async def main() -> None:
     for prompt in PROMPTS:
         print(f"\n{'='*60}")
-        print(f"Prompt: {prompt}")
+        print(f"Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
         print("=" * 60)
         result = await Runner.run(agent, prompt)
         print(result.final_output)
