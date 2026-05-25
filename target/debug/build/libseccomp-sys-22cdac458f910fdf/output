@@ -1,3 +1,0 @@
-cargo:rerun-if-env-changed=LIBSECCOMP_LIB_PATH
-cargo:rerun-if-env-changed=LIBSECCOMP_LINK_TYPE
-cargo:rustc-link-lib=dylib=seccomp
