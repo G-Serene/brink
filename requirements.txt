@@ -1,0 +1,403 @@
+# `sandbox-core` — Corrected System Requirements
+
+**Target:** `x86_64-unknown-linux-gnu`, Ubuntu 24.04, Linux kernel 6.8+
+**Rust Edition:** 2021
+**Allowed dependencies:** `libc`, `nix`, `libseccomp-rs`, `landlock`, `tokio`
+**Performance budget:** Cold-start under 10ms
+
+---
+
+## 1. Crate Module Structure
+
+```
+sandbox-core/
+├── lib.rs               — public API surface only
+├── error.rs             — SandboxError, TerminationReason enums
+├── config.rs            — SandboxConfig, ResourceLimits structs
+├── report.rs            — ExecutionReport struct
+├── fork_server.rs       — pre-runtime fork server (Unix socket IPC)
+├── cgroup.rs            — cgroup v2 lifecycle management
+├── namespace.rs         — all unshare/clone namespace logic
+├── mount.rs             — pivot_root, devpts, proc, tmpfs setup
+├── landlock.rs          — Landlock ruleset construction
+├── seccomp.rs           — seccomp-BPF filter construction
+├── pty.rs               — PTY master/slave allocation and async I/O
+└── supervisor.rs        — timeout, cgroup.kill, waitpid, report assembly
+```
+
+---
+
+## 2. Public API Surface
+
+### `SandboxConfig`
+```
+workspace_path: PathBuf       — the one directory mapped R/W inside the sandbox
+memory_max_bytes: u64         — hard memory ceiling (e.g. 512 MiB)
+cpu_quota_us: u64             — CPU quota per period in microseconds
+cpu_period_us: u64            — CPU quota period (e.g. 100_000 = 100ms)
+pids_max: u32                 — maximum number of PIDs (fork bomb prevention)
+ttl: Duration                 — wall-clock timeout before forcible termination
+argv: Vec<String>             — command + arguments to execute
+env: Vec<(String, String)>    — explicit environment for the child (no inherit)
+```
+
+### `ResourceLimits` (supplementary RLIMIT_ layer)
+```
+max_open_files: u64
+max_file_size_bytes: u64
+stack_size_bytes: u64
+```
+
+### `ExecutionReport`
+```
+exit_status: ExitStatus
+termination_reason: TerminationReason
+stdout_bytes: Vec<u8>          — captured from PTY master
+stderr_bytes: Vec<u8>
+wall_time: Duration
+peak_memory_bytes: u64         — read from memory.peak in the cgroup after exit
+cpu_time_us: u64               — read from cpu.stat in the cgroup after exit
+seccomp_violation: Option<u32> — syscall number if killed by seccomp
+```
+
+### `TerminationReason`
+```
+Exited(i32)                    — clean exit with code
+TimedOut                       — TTL expired; cgroup.kill was used
+OomKilled                      — memory.events reported oom_kill > 0
+SeccompViolation(u32)          — killed by a seccomp KILL action
+SignalKilled(i32)              — killed by an unexpected signal
+CgroupKillFallback             — TTL expired; cgroup.kill path taken
+```
+
+### `SandboxError`
+```
+CgroupCreateFailed(io::Error)
+CgroupDelegationMissing        — /sys/fs/cgroup/$slice not writable; delegation not set up
+NamespaceCloneFailed(Errno)
+UserNamespaceSetupFailed(Errno)
+MountFailed { step: &'static str, source: Errno }
+PivotRootFailed(Errno)
+LandlockUnsupported(u32)       — kernel ABI version too old; minimum required version
+LandlockRulesetFailed(Errno)
+SeccompLoadFailed(Errno)
+PtyOpenFailed(Errno)
+ForkServerUnavailable
+ExecFailed(Errno)
+IoTimeout
+WaitFailed(Errno)
+```
+
+### Primary entry point
+```
+pub async fn run(config: SandboxConfig) -> Result<ExecutionReport, SandboxError>
+```
+
+No `.unwrap()`, `.expect()`, or `panic!()` anywhere in the crate. Every fallible operation returns `Result`. Every `unsafe` block must be preceded by a `// SAFETY:` comment proving the absence of data races, UB, and memory corruption.
+
+---
+
+## 3. Fork Server — Requirement
+
+**The problem this solves:** `fork()` called inside a live Tokio multi-threaded runtime is undefined behavior. After a fork, only async-signal-safe functions are legal in the child, but Tokio's internal state (thread pool mutexes, epoll fd, timers) is copied in a potentially locked state.
+
+**Required design:**
+
+Before the Tokio runtime is started, `sandbox-core` must spawn a dedicated **fork server** process. The fork server is a minimal single-threaded process that:
+
+- Listens on an anonymous `AF_UNIX` `SOCK_SEQPACKET` socket pair.
+- Receives spawn requests from the parent (serialised `SandboxConfig` fields).
+- Is the *only* process that ever calls `clone()` or `fork()`.
+- Sends back the child PID and a `pidfd` (via `SCM_RIGHTS` ancillary data) to the Tokio parent.
+- Stays alive for the lifetime of the library; errors are reported back over the socket.
+
+The Tokio runtime communicates with the fork server over the socket using async I/O. The fork server itself never touches the Tokio runtime.
+
+---
+
+## 4. Security Layers — Detailed Requirements
+
+### Layer 0: Pre-spawn — Cgroup v2 slice
+
+**Prerequisite:** The host must have cgroup v2 delegation enabled. This means the user running the process must own a cgroup subtree, which requires either:
+- A systemd user unit or transient scope with `Delegate=yes` and `DelegateSubgroup=sandbox-core`, or
+- The operator has granted write access to a subtree under `/sys/fs/cgroup/` for the running user.
+
+If the target cgroup directory is not writable, `run()` must return `SandboxError::CgroupDelegationMissing` immediately rather than failing mid-spawn.
+
+**Required cgroup files to write before `clone()`:**
+```
+cgroup.subtree_control   ← write "+memory +cpu +pids"
+memory.max               ← config.memory_max_bytes
+memory.swap.max          ← 0  (disable swap entirely)
+cpu.max                  ← "{quota_us} {period_us}"
+pids.max                 ← config.pids_max
+```
+
+The cgroup must be created and all limits written **before** the fork server is asked to spawn the child. After all limits are written, the fork server writes the child's PID into `cgroup.procs` immediately post-fork, before the child has executed a single instruction in the child setup code.
+
+---
+
+### Layer 1: User Namespace + UID/GID Mapping
+
+The fork server calls `clone(CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWCGROUP)` in a single call. All namespaces are created simultaneously.
+
+**`CLONE_NEWCGROUP` is required** so the child cannot see or modify the host cgroup hierarchy.
+
+After the child is created, the **parent side** (fork server) must perform the UID/GID mapping writes in this exact order:
+
+1. Write `"deny"` to `/proc/<child_pid>/setgroups`
+2. Write `"0 <host_uid> 1"` to `/proc/<child_pid>/uid_map`
+3. Write `"0 <host_gid> 1"` to `/proc/<child_pid>/gid_map`
+
+Steps 1–3 must complete before the child is signalled to continue (synchronised via a pipe or `eventfd`). If step 1 is skipped or reordered, `gid_map` writes will fail with `EPERM` on all kernels ≥ 3.19.
+
+The child blocks on the synchronisation primitive until all three writes are confirmed, then proceeds with mount setup.
+
+---
+
+### Layer 2: Mount Namespace Setup
+
+All steps occur inside the child process after UID/GID mapping is confirmed.
+
+**Step 1 — Break shared propagation:**
+```
+mount("", "/", MS_REC | MS_PRIVATE)
+```
+This must be the very first mount operation. Without it, any mounts created inside the namespace propagate back to the host's shared subtree, defeating isolation.
+
+**Step 2 — Assemble a minimal rootfs in a tmpfs:**
+
+Create a private tmpfs at a scratch directory (e.g. `/tmp/sandbox-root-<random>`), then create the following structure inside it:
+```
+/proc        — empty dir, for new procfs
+/tmp         — empty dir, for child scratch
+/dev         — empty dir, then populated below
+/dev/pts     — empty dir, for devpts
+/dev/shm     — empty dir
+/workspace   — bind mount of config.workspace_path
+```
+
+**Step 3 — Mount devpts:**
+```
+mount("devpts", "/dev/pts", MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666")
+```
+Then bind-mount or create `/dev/ptmx` pointing into the new devpts instance. This is required for PTY slave allocation inside the namespace. Also create bind mounts for `/dev/null`, `/dev/zero`, and `/dev/urandom` from the host.
+
+**Step 4 — Mount proc:**
+```
+mount("proc", "/proc", MS_NOSUID | MS_NODEV | MS_NOEXEC)
+```
+After mounting, bind-mount the following paths as read-only and empty (to mask dangerous interfaces):
+```
+/proc/sys         → read-only bind of an empty tmpdir
+/proc/sysrq-trigger → masked
+/proc/irq         → masked
+/proc/acpi        → masked
+```
+
+**Step 5 — Mount workspace:**
+```
+bind mount config.workspace_path → /workspace, MS_BIND | MS_REC
+```
+
+**Step 6 — `pivot_root`:**
+
+`chroot` must not be used. `pivot_root` is required because a process holding `CAP_SYS_CHROOT` inside a user namespace can escape a `chroot` jail. The sequence is:
+1. `pivot_root(new_root, put_old)` to make the tmpfs the new root.
+2. `umount2(put_old, MNT_DETACH)` to remove the old root from the namespace entirely.
+3. `rmdir(put_old)`.
+
+After `pivot_root`, the host filesystem is completely unreachable — there is no mount point that leads back to it.
+
+---
+
+### Layer 3: Landlock LSM
+
+Check the kernel's Landlock ABI version via `landlock_create_ruleset` with `LANDLOCK_CREATE_RULESET_VERSION`. The minimum acceptable ABI version is **2** (Linux 5.19, for directory access controls). If the running kernel is below this, return `SandboxError::LandlockUnsupported(version)`.
+
+**Ruleset construction:**
+
+The ruleset must deny all access rights by default (allow-list model) and then grant only:
+
+| Path | Rights granted |
+|---|---|
+| `/workspace` | `LANDLOCK_ACCESS_FS_READ_FILE`, `WRITE_FILE`, `READ_DIR`, `MAKE_REG`, `REMOVE_FILE`, `TRUNCATE` |
+| `/tmp` | Same as workspace |
+| `/dev/null` | `READ_FILE`, `WRITE_FILE` |
+| `/dev/urandom` | `READ_FILE` |
+| `/dev/pts/*` | `READ_FILE`, `WRITE_FILE` |
+| `/proc/self` | `READ_FILE`, `READ_DIR` (minimal, for runtime linker) |
+
+No rule for the host filesystem root is added — anything not explicitly listed is inaccessible.
+
+Note: Landlock does not restrict network operations below ABI v4 (Linux 6.7). Network is handled entirely by `CLONE_NEWNET` (complete isolation) and by the seccomp socket rules below.
+
+---
+
+### Layer 4: Capability Drop
+
+Inside the user namespace, the child process holds a full capability set within the namespace. Before calling `execve`, the child must explicitly drop all capabilities:
+
+1. Call `prctl(PR_SET_SECUREBITS, SECBIT_KEEP_CAPS_LOCKED | SECBIT_NO_SETUID_FIXUP | SECBIT_NOROOT | SECBIT_NOROOT_LOCKED)` to prevent any capability re-acquisition via setuid binaries.
+2. Call `cap_set_proc` with an empty permitted, effective, and inheritable set.
+
+This step occurs **after** mount setup (which requires some capabilities) and **before** seccomp is applied.
+
+---
+
+### Layer 5: Seccomp-BPF Filter
+
+**`PR_SET_NO_NEW_PRIVS` must be called first.** Without `prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)`, calling `seccomp()` from an unprivileged process returns `EACCES`. This call also prevents any child process from gaining new privileges via setuid/setgid. This call must be made before `seccomp_load()`.
+
+Also call `prctl(PR_SET_DUMPABLE, 0)` to prevent `/proc/<pid>/mem` reads from any other process.
+
+**Default action:** `SCMP_ACT_ERRNO(EPERM)` — return an error rather than `SCMP_ACT_KILL_PROCESS`, so the program can handle the failure gracefully and the event is observable in the `ExecutionReport`.
+
+**Exceptions — explicitly blocked regardless of default action:** These must use `SCMP_ACT_KILL_PROCESS`:
+```
+ptrace
+process_vm_readv / process_vm_writev
+kexec_load / kexec_file_load
+```
+
+**Blocked socket families** (any `socket()` call with these `domain` arguments → `SCMP_ACT_ERRNO(EACCES)`):
+```
+AF_INET, AF_INET6, AF_PACKET, AF_NETLINK, AF_VSOCK
+```
+`AF_UNIX` is permitted (needed by many runtimes for internal IPC).
+
+**Explicitly blocked syscalls** (return `SCMP_ACT_ERRNO(EPERM)`):
+```
+unshare                   — prevent namespace escape from within
+clone (with CLONE_NEWUSER) — prevent nested user ns creation
+mount / umount2           — no re-mounting from inside
+pivot_root / chroot       — no rootfs manipulation
+setuid / setgid / setgroups
+io_uring_setup / io_uring_enter / io_uring_register  — known filter bypass vector
+userfaultfd               — exploitation primitive
+perf_event_open           — side-channel and exploitation surface
+bpf                       — privilege escalation surface
+add_key / request_key / keyctl  — kernel keyring access
+```
+
+**`SECCOMP_FILTER_FLAG_TSYNC`** must be set on `seccomp_load()` to ensure the filter applies to all threads, not just the calling thread.
+
+---
+
+## 5. PTY Allocation — Requirements
+
+The PTY master must be opened in the **parent** (fork server), before `clone()`, because `/dev/ptmx` on the host is accessible there. The sequence is:
+
+1. Parent opens `/dev/ptmx` → `master_fd`. Set `O_CLOEXEC | O_NONBLOCK` on `master_fd`.
+2. Parent calls `grantpt(master_fd)` then `unlockpt(master_fd)`.
+3. Parent calls `ptsname(master_fd)` to get the slave path.
+4. After `clone()` and mount setup, the child opens the slave path (now within the new devpts mount) → `slave_fd`. Set `slave_fd` as the child's `stdin`, `stdout`, and `stderr` via `dup2`.
+5. Parent closes `slave_fd`. Child closes `master_fd`.
+6. `master_fd` is passed to Tokio as an async fd (via `AsyncFd`) for non-blocking read of the child's output stream.
+
+`TIOCSWINSZ` must be called on `master_fd` to set a reasonable initial window size (e.g. 220×50) before the child calls `exec`. Programs that query terminal dimensions on startup will otherwise receive a zero-size window.
+
+---
+
+## 6. Execution Lifecycle — Step-by-Step
+
+```
+1.  [Startup, before Tokio]   Fork the fork server process. Establish the Unix socket pair.
+                               Fork server enters its request loop (blocks on socket read).
+
+2.  [Tokio parent]            Validate SandboxConfig. Return SandboxError early if invalid.
+
+3.  [Tokio parent]            Verify cgroup delegation: check that the target cgroup subtree
+                               directory exists and is writable. If not → CgroupDelegationMissing.
+
+4.  [Tokio parent]            Create ephemeral cgroup slice directory.
+                               Write subtree_control, memory.max, memory.swap.max,
+                               cpu.max, pids.max.
+
+5.  [Tokio parent]            Open PTY master fd. Call grantpt + unlockpt + ptsname.
+
+6.  [Tokio parent]            Send spawn request (config + cgroup path + master_fd) to
+                               fork server over Unix socket (SCM_RIGHTS for the master_fd).
+
+7.  [Fork server]             Call close_range(3, ~0, CLOSE_RANGE_CLOEXEC) to mark all
+                               non-essential fds as close-on-exec.
+                               Call clone(CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS |
+                               CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWIPC |
+                               CLONE_NEWCGROUP | CLONE_PIDFD) with a sync eventfd pair.
+                               Child blocks on eventfd read immediately.
+
+8.  [Fork server]             Write the child PID into cgroup.procs.
+                               Write setgroups=deny, uid_map, gid_map.
+                               Signal child via eventfd write (value=1 = proceed).
+                               Send (child_pid, pidfd) back to Tokio parent via socket.
+
+9.  [Child]                   Receive eventfd signal confirming UID/GID mapping is done.
+                               mount("", "/", MS_REC | MS_PRIVATE)             — break propagation
+                               Assemble rootfs tmpfs + /proc /tmp /dev /dev/pts /workspace dirs
+                               mount devpts at /dev/pts with newinstance option
+                               Bind-mount /dev/null, /dev/zero, /dev/urandom
+                               bind-mount workspace
+                               mount procfs + mask /proc/sys etc.
+                               pivot_root into new tmpfs root; umount2 old root MNT_DETACH
+
+10. [Child]                   Construct and apply Landlock ruleset.
+
+11. [Child]                   Drop all capabilities via cap_set_proc + PR_SET_SECUREBITS.
+
+12. [Child]                   Open PTY slave fd. dup2 to stdin/stdout/stderr.
+
+13. [Child]                   prctl(PR_SET_NO_NEW_PRIVS, 1)
+                               prctl(PR_SET_DUMPABLE, 0)
+
+14. [Child]                   Build and load seccomp filter with SECCOMP_FILTER_FLAG_TSYNC.
+
+15. [Child]                   execve(argv[0], argv, env)  — point of no return
+
+16. [Tokio parent]            Wrap pidfd in Tokio future. Start TTL timer.
+                               Read PTY master fd asynchronously into stdout_bytes / stderr_bytes.
+
+17. [Tokio parent — TTL path] If timer fires before pidfd is readable:
+                               Write "1" to cgroup/cgroup.kill  — atomically kills every process
+                               in the cgroup, including background forks and zombie children.
+                               Wait for pidfd to become readable (confirms all processes dead).
+                               Record TerminationReason::TimedOut.
+
+18. [Tokio parent — exit path] pidfd becomes readable → read exit status via waitid(P_PIDFD).
+                                Read memory.peak, cpu.stat from cgroup before destruction.
+                                Check memory.events for oom_kill counter.
+                                Assemble ExecutionReport.
+
+19. [Tokio parent — cleanup]   rmdir(cgroup_path) — removes the ephemeral slice.
+                                All fds (master_fd, pidfd) are dropped.
+                                Return Ok(ExecutionReport).
+```
+
+---
+
+## 7. Resource Cleanup Guarantees
+
+- The cgroup and its `cgroup.kill` write must be wrapped in a Rust `Drop` guard so that cleanup occurs even if the Tokio future is cancelled.
+- `pidfd` must be used instead of raw PID-based `waitpid` to eliminate the PID reuse race condition — a new process could be assigned the same PID before the parent calls `waitpid`.
+- `cgroup.kill` terminates every process in the hierarchy atomically, including any processes that re-forked inside the sandbox. Writing `1` to it is always preferred over sending `SIGKILL` to the top-level child PID.
+- After `cgroup.kill`, poll the `pids.current` file until it reads `0` before calling `rmdir` on the cgroup directory (the kernel rejects `rmdir` on a non-empty cgroup).
+
+---
+
+## 8. Invariants Summary
+
+| Property | Mechanism |
+|---|---|
+| No root required | `CLONE_NEWUSER` + systemd cgroup delegation |
+| Memory bounded | `memory.max` + `memory.swap.max=0` in cgroup v2 |
+| CPU bounded | `cpu.max` quota in cgroup v2 |
+| Fork bomb prevented | `pids.max` in cgroup v2 |
+| Network fully isolated | `CLONE_NEWNET` (no interfaces, no routing) |
+| Filesystem isolated | `pivot_root` + Landlock allow-list |
+| Syscall surface minimised | Seccomp-BPF with explicit block list |
+| Privilege re-acquisition blocked | `PR_SET_NO_NEW_PRIVS` + capability drop + `SECBIT_NOROOT` |
+| No blocking I/O deadlocks | PTY master/slave instead of pipes |
+| Atomic process termination | `cgroup.kill` on TTL or error |
+| No PID reuse races | `CLONE_PIDFD` + `waitid(P_PIDFD)` |
+| No FD inheritance | `CLONE_PIDFD` + `close_range(CLOSE_RANGE_CLOEXEC)` pre-exec |
+| No panics | `Result`-typed API throughout; no `.unwrap()` / `.expect()` |
